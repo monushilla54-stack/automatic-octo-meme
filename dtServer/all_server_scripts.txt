@@ -1,0 +1,2326 @@
+﻿
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\server.js 
+// ========================================== 
+
+'use strict';
+
+require('./config/environment');
+
+const http    = require('http');
+const path    = require('path');
+const express = require('express');
+const rateLimit = require('express-rate-limit');
+
+const { testConnection: dbTest }   = require('./config/database');
+const { testConnection: redisTest } = require('./config/redis');
+const socketServer  = require('./websocket/socketServer');
+const { registerEvents } = require('./websocket/socketEvents');
+const tableManager  = require('./game/tableManager');
+const authController = require('./auth/authController');
+const { authenticateToken } = require('./auth/jwtMiddleware');
+const botManager    = require('./game/botManager');
+const depositRouter = require('./payment/paymentDemo');
+const verifyRouter  = require('./routes/verifyRoute');
+const { port, nodeEnv } = require('./config/environment');
+const logger = require('./utils/logger');
+
+async function bootstrap() {
+  const app = express();
+
+  // â”€â”€ CORS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+  });
+
+  app.use(express.json({ limit: '16kb' })); // reject huge payloads
+
+  // â”€â”€ Serve web client (static, no auth needed) â”€â”€â”€â”€â”€â”€â”€â”€
+  // Static client serving removed for production API deployment
+
+
+  // â”€â”€ Public health check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  app.get('/health', (_req, res) =>
+    res.json({ status: 'ok', env: nodeEnv, time: new Date().toISOString() })
+  );
+
+  // â”€â”€ Rate limiter for auth endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // 10 attempts per IP per 15 minutes â€” prevents brute force
+  const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many attempts. Please try again after 15 minutes.' },
+  });
+
+  // â”€â”€ PUBLIC endpoints (no token required) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  app.post('/register', authLimiter, authController.register);
+  app.post('/login',    authLimiter, authController.login);
+  app.post('/guest',    authLimiter, authController.guest);
+
+  // â”€â”€ PRIVATE endpoints â€” must be authenticated â”€â”€â”€â”€â”€â”€â”€â”€
+  // All routes below this line require a valid JWT
+  app.use(authenticateToken);
+
+  app.use('/deposit', depositRouter);
+  app.use('/verify',  verifyRouter);  // fairness data â€” only for logged-in users
+
+  // Catch-all for unknown authenticated routes
+  app.use('/api/*', (_req, res) => res.status(404).json({ error: 'Not found' }));
+
+  // â”€â”€ Native WebSockets (System.Net.WebSockets) â”€â”€
+  const httpServer = http.createServer(app);
+  const { wss, ioShim } = socketServer.init(httpServer);
+  wss.on('connection', (ws) => registerEvents(ws));
+
+  // â”€â”€ Infrastructure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  await redisTest();
+
+  // â”€â”€ Game â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  tableManager.init(ioShim);
+  botManager.init();
+  logger.info('Table manager ready', { tables: tableManager.listTables() });
+
+  // â”€â”€ Listen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  httpServer.listen(port, '0.0.0.0', () => {
+    logger.info(`Dragon Tiger server â†’ http://0.0.0.0:${port}`, { nodeEnv });
+  });
+
+  // â”€â”€ Graceful shutdown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const shutdown = (signal) => {
+    logger.info(`${signal} â€” shutting down`);
+    botManager.shutdown();
+    httpServer.close(() => process.exit(0));
+  };
+  process.on('SIGINT',  () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('uncaughtException',  (err) => logger.error('Uncaught exception',  { stack: err.stack }));
+  process.on('unhandledRejection', (r)   => logger.error('Unhandled rejection', { reason: String(r) }));
+}
+
+bootstrap().catch((err) => {
+  console.error('Server failed to start:', err.stack || err.message);
+  process.exit(1);
+});
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\auth\authController.js 
+// ========================================== 
+
+'use strict';
+
+const authService = require('./authService');
+const validationService = require('../services/validationService');
+const logger = require('../utils/logger');
+
+/**
+ * POST /register
+ */
+async function register(req, res) {
+    const { error, value } = validationService.validateRegistration(req.body);
+    if (error) {
+        return res.status(400).json({ error: error.details[0].message });
+    }
+
+    try {
+        const result = await authService.register(value);
+        logger.info('Registration endpoint success', { playerId: result.playerId });
+        return res.status(201).json({ success: true, ...result });
+    } catch (err) {
+        if (err.statusCode === 409) {
+            return res.status(409).json({ error: err.message });
+        }
+        logger.error('Registration endpoint error', { error: err.message });
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+}
+
+/**
+ * POST /login
+ */
+async function login(req, res) {
+    const { error, value } = validationService.validateLogin(req.body);
+    if (error) {
+        return res.status(400).json({ error: error.details[0].message });
+    }
+
+    try {
+        const result = await authService.login(value);
+        return res.status(200).json(result);
+    } catch (err) {
+        if (err.statusCode === 401) {
+            return res.status(401).json({ error: err.message });
+        }
+        logger.error('Login endpoint error', { error: err.message });
+    }
+}
+
+/**
+ * POST /guest
+ */
+async function guest(req, res) {
+    try {
+        const result = await authService.guestLogin();
+        return res.status(200).json(result);
+    } catch (err) {
+        logger.error('Guest login endpoint error', { error: err.message });
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+}
+
+module.exports = { register, login, guest };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\auth\authService.js 
+// ========================================== 
+
+'use strict';
+
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const userModel = require('../models/userModel');
+const walletService = require('../wallet/walletService');
+const { bcryptRounds, jwtSecret } = require('../config/environment');
+const logger = require('../utils/logger');
+
+/**
+ * Register a new player.
+ */
+async function register({ email, username, password }) {
+    const existing = await userModel.findByEmail(email);
+    if (existing) {
+        const err = new Error('Email already registered');
+        err.statusCode = 409;
+        throw err;
+    }
+
+    const passwordHash = await bcrypt.hash(password, bcryptRounds);
+    const user = await userModel.create({ email, username, passwordHash });
+
+    logger.info('Player registered', { playerId: user.id, username });
+    return { playerId: user.id, username: user.username };
+}
+
+/**
+ * Login an existing player.
+ * Returns JWT token, playerId, and current wallet balance.
+ */
+async function login({ email, password }) {
+    const user = await userModel.findByEmail(email);
+    if (!user) {
+        const err = new Error('Invalid credentials');
+        err.statusCode = 401;
+        throw err;
+    }
+
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) {
+        const err = new Error('Invalid credentials');
+        err.statusCode = 401;
+        throw err;
+    }
+
+    const token = jwt.sign(
+        { playerId: user.id, username: user.username },
+        jwtSecret,
+        { algorithm: 'HS256', expiresIn: '7d' }  // 7-day token, algo locked to HS256
+    );
+
+    const walletBalance = await walletService.getBalance(user.id);
+
+    logger.info('Player logged in', { playerId: user.id });
+    return { token, playerId: user.id, username: user.username, walletBalance };
+}
+
+/**
+ * Generate a short-lived Guest Session.
+ * Does not create a database user, just provisions a JWT with a demo wallet balance.
+ */
+async function guestLogin() {
+    // Generate a random guest ID (e.g., Guest_4912)
+    const randomNum = Math.floor(Math.random() * 9000) + 1000;
+    const guestId = `guest_${Date.now()}_${randomNum}`;
+    const username = `Guest_${randomNum}`;
+    
+    // Assign 10000 demo chips for the guest user directly into Redis
+    const demoBalance = 10000;
+    await walletService.updateBalance(guestId, demoBalance);
+
+    // Provide a token valid for 24 hours
+    const token = jwt.sign(
+        { playerId: guestId, username: username, isGuest: true },
+        jwtSecret,
+        { algorithm: 'HS256', expiresIn: '24h' }
+    );
+
+    logger.info('Guest session created', { guestId, username });
+    return { token, playerId: guestId, username, walletBalance: demoBalance, isGuest: true };
+}
+
+module.exports = { register, login, guestLogin };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\auth\jwtMiddleware.js 
+// ========================================== 
+
+'use strict';
+
+const jwt = require('jsonwebtoken');
+const { jwtSecret } = require('../config/environment');
+const logger = require('../utils/logger');
+
+/**
+ * Express middleware â€” verifies JWT Bearer token on every protected request.
+ * Attaches req.user = { playerId, username } on success.
+ * Rejects with 401 on any failure (missing, expired, malformed, wrong algorithm).
+ */
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authorization required. Please log in.' });
+  }
+
+  const token = authHeader.slice(7).trim();
+  if (!token) {
+    return res.status(401).json({ error: 'Empty token provided.' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, jwtSecret, {
+      algorithms: ['HS256'],      // reject any other algorithm (alg:none attack)
+      clockTolerance: 30,         // allow 30s clock skew
+    });
+
+    // Ensure required claims are present
+    if (!decoded.playerId || !decoded.username) {
+      return res.status(401).json({ error: 'Invalid token payload.' });
+    }
+
+    req.user = { playerId: decoded.playerId, username: decoded.username };
+    next();
+  } catch (err) {
+    const reason =
+      err.name === 'TokenExpiredError'  ? 'Token has expired. Please log in again.' :
+      err.name === 'JsonWebTokenError'  ? 'Invalid token. Please log in again.'     :
+      err.name === 'NotBeforeError'     ? 'Token not yet valid.'                    :
+                                          'Authentication failed.';
+    logger.warn('JWT verification failed', { error: err.name, ip: req.ip });
+    return res.status(401).json({ error: reason });
+  }
+}
+
+module.exports = { authenticateToken };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\config\database.js 
+// ========================================== 
+
+'use strict';
+
+const logger = require('../utils/logger');
+
+// Demo mode: No Postgres required
+async function query(text, params) {
+  logger.debug('Mock Query Executed: ' + text);
+  return { rows: [] };
+}
+
+async function withTransaction(fn) {
+  return await fn({});
+}
+
+async function testConnection() {
+  logger.info('Demo Mode Active: Postgres bypassed.');
+}
+
+module.exports = { query, withTransaction, testConnection, pool: null };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\config\environment.js 
+// ========================================== 
+
+'use strict';
+
+require('dotenv').config();
+const Joi = require('joi');
+
+const schema = Joi.object({
+  PORT: Joi.number().default(3000),
+  NODE_ENV: Joi.string().valid('development', 'production', 'test').default('development'),
+  DATABASE_URL: Joi.string().optional(),
+  REDIS_URL: Joi.string().optional(),
+  JWT_SECRET: Joi.string().optional(),
+  BCRYPT_ROUNDS: Joi.number().integer().min(10).default(12),
+  MIN_BET_AMOUNT: Joi.number().positive().default(1),
+  MAX_BET_AMOUNT: Joi.number().positive().default(10000),
+  MAX_PLAYERS_PER_TABLE: Joi.number().integer().positive().default(100),
+  BETTING_PHASE_DURATION: Joi.number().integer().positive().default(10000),
+  REVEAL_PHASE_DURATION: Joi.number().integer().positive().default(3000),
+  SETTLEMENT_PHASE_DURATION: Joi.number().integer().positive().default(2000),
+}).unknown(true);
+
+const { error, value: env } = schema.validate(process.env);
+
+if (error) {
+  logger.warn(`Environment validation failed: ${error.message}. Proceeding in DEMO mode with defaults.`);
+}
+
+module.exports = {
+  port: env.PORT,
+  nodeEnv: env.NODE_ENV,
+  databaseUrl: env.DATABASE_URL,
+  redisUrl: env.REDIS_URL,
+  jwtSecret: env.JWT_SECRET,
+  bcryptRounds: env.BCRYPT_ROUNDS,
+  game: {
+    minBet: env.MIN_BET_AMOUNT,
+    maxBet: env.MAX_BET_AMOUNT,
+    maxPlayersPerTable: env.MAX_PLAYERS_PER_TABLE,
+    bettingPhaseDuration: env.BETTING_PHASE_DURATION,
+    revealPhaseDuration: env.REVEAL_PHASE_DURATION,
+    settlementPhaseDuration: env.SETTLEMENT_PHASE_DURATION,
+  },
+};
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\config\redis.js 
+// ========================================== 
+
+'use strict';
+
+const { createClient } = require('redis');
+const logger = require('../utils/logger');
+
+let client = null;
+
+function createInMemoryStub() {
+  const sets = {}, hashes = {}, strings = {};
+  logger.warn('Redis not available â€” using in-memory stub (dev only)');
+  return {
+    isReady: true, isStub: true,
+    ping: async () => 'PONG',
+    get:  async (k)      => strings[k] || null,
+    set:  async (k, v)   => { strings[k] = v; },
+    del:  async (k)      => { delete sets[k]; delete hashes[k]; delete strings[k]; },
+    expire: async ()     => {},
+    sAdd: async (k, v)   => { if (!sets[k]) sets[k] = new Set(); if (sets[k].has(v)) return 0; sets[k].add(v); return 1; },
+    sRem: async (k, v)   => { sets[k] && sets[k].delete(v); },
+    hIncrByFloat: async (k, f, by) => {
+      if (!hashes[k]) hashes[k] = {};
+      hashes[k][f] = (parseFloat(hashes[k][f] || 0) + parseFloat(by)).toFixed(2);
+      return hashes[k][f];
+    },
+  };
+}
+
+async function getClient() {
+  if (!client) {
+    client = createInMemoryStub();
+  }
+  return client;
+}
+
+async function testConnection() {
+  const c = await getClient();
+  logger.warn('Redis: in-memory stub active (DEMO MODE)');
+}
+
+module.exports = { getClient, testConnection };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\game\betManager.js 
+// ========================================== 
+
+'use strict';
+
+const { getClient } = require('../config/redis');
+const betModel = require('../models/betModel');
+const walletService = require('../wallet/walletService');
+const ledgerService = require('../wallet/ledgerService');
+const validationService = require('../services/validationService');
+const { game } = require('../config/environment');
+const logger = require('../utils/logger');
+
+// Replay protection window: reject bets with timestamps older than this
+const REPLAY_WINDOW_MS = 5000;
+// Close betting this many ms before betEndTime to absorb network latency
+const EARLY_CLOSE_MS = 500;
+
+/**
+ * Process a PLACE_BET event from a player.
+ */
+async function processBet({ playerId, roundId, tableId, betEndTime, data }) {
+    // --- 1. Validate message schema ---
+    const { error, value } = validationService.validateBetMessage(data);
+    if (error) {
+        return { success: false, reason: `invalid_payload: ${error.details[0].message}` };
+    }
+
+    const { betId, area, amount, timestamp } = value;
+
+    // --- 2. Replay protection ---
+    const now = Date.now();
+    if (now - timestamp > REPLAY_WINDOW_MS) {
+        logger.warn('Replay attack detected', { playerId, betId, timestamp, now });
+        return { success: false, reason: 'timestamp_expired' };
+    }
+
+    // --- 3. Betting window check (server-authoritative, early close) ---
+    const effectiveCloseTime = betEndTime - EARLY_CLOSE_MS;
+    if (now >= effectiveCloseTime) {
+        return { success: false, reason: 'betting_closed' };
+    }
+
+    // --- 4. Bet amount limits ---
+    if (amount < game.minBet || amount > game.maxBet) {
+        return { success: false, reason: `amount_out_of_range: min=${game.minBet} max=${game.maxBet}` };
+    }
+
+    // --- 5. Duplicate bet protection (Redis Set) ---
+    const redis = await getClient();
+    const dedupKey = `table:${tableId}:processed_bets`;
+    const isNew = await redis.sAdd(dedupKey, betId);
+    // sAdd returns number of elements added; 0 means already existed
+    if (isNew === 0) {
+        logger.warn('Duplicate bet rejected', { playerId, betId });
+        return { success: false, reason: 'duplicate' };
+    }
+    // Set expiry so Redis doesn't grow unbounded (keep for 2 minutes)
+    await redis.expire(dedupKey, 120);
+
+    // --- 6. Balance check ---
+    const hasFunds = await walletService.hasEnoughBalance(playerId, amount);
+    if (!hasFunds) {
+        await redis.sRem(dedupKey, betId);
+        return { success: false, reason: 'insufficient_balance' };
+    }
+
+    // --- 7. In-Memory write: lock funds + store bet ---
+    let bet;
+    try {
+        await ledgerService.lockBet(playerId, amount, betId);
+        bet = await betModel.createBet({
+            clientBetId: betId,
+            playerId,
+            roundId,
+            betArea: area,
+            amount,
+        });
+    } catch (err) {
+        await redis.sRem(dedupKey, betId);
+        logger.error('Bet transaction failed', { playerId, betId, error: err.message });
+        return { success: false, reason: 'server_error' };
+    }
+
+    // --- 8. Update Redis bet totals ---
+    const totalsKey = `table:${tableId}:bets`;
+    await redis.hIncrByFloat(totalsKey, area, amount);
+
+    logger.info('Bet accepted', { playerId, betId, area, amount, roundId });
+    return { success: true, bet };
+}
+
+module.exports = { processBet };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\game\botManager.js 
+// ========================================== 
+
+'use strict';
+
+const logger = require('../utils/logger');
+const tableManager = require('./tableManager');
+const betManager = require('./betManager');
+const walletService = require('../wallet/walletService');
+
+const DEMO_BOTS = [
+    { id: 'bot_101', name: 'DemoBot_101', balance: 125000 },
+    { id: 'bot_202', name: 'DemoBot_202', balance: 94000 },
+    { id: 'bot_303', name: 'DemoBot_303', balance: 350000 },
+    { id: 'bot_404', name: 'DemoBot_404', balance: 67000 },
+    { id: 'bot_505', name: 'DemoBot_505', balance: 21000 },
+];
+
+const BET_AREAS = ['dragon', 'tiger', 'tie'];
+const BET_AMOUNTS = [100, 500, 1000];
+
+let botInterval = null;
+
+function init() {
+    logger.info('Demo Bots Engine Initialized');
+    
+    // Periodically check tables and place random bets if in BETTING phase
+    botInterval = setInterval(async () => {
+        try {
+            const tables = tableManager.listTables();
+            for (const tableId of tables) {
+                const ts = tableManager.getTableState(tableId);
+                const rm = tableManager.getRoundManager(tableId);
+                
+                if (!ts || !rm) continue;
+
+                // Only bet if the round phase is BETTING
+                const state = await rm.getStateSnapshot();
+                if (state.phase !== 'BETTING') continue;
+
+                // Add bots to table if they aren't there yet
+                for (const bot of DEMO_BOTS) {
+                    if (!ts._players.has(bot.id)) {
+                        walletService.demoWallets.set(bot.id, bot.balance);
+                        ts.upsertPlayer({
+                            playerId: bot.id,
+                            username: bot.name,
+                            balance: bot.balance,
+                            socketId: null
+                        });
+                    }
+                }
+
+                // Randomly decide if a bot should bet this tick (approx 30% chance)
+                if (Math.random() < 0.3) {
+                    const randomBot = DEMO_BOTS[Math.floor(Math.random() * DEMO_BOTS.length)];
+                    const randomArea = BET_AREAS[Math.floor(Math.random() * BET_AREAS.length)];
+                    const randomAmount = BET_AMOUNTS[Math.floor(Math.random() * BET_AMOUNTS.length)];
+
+                    const roundId = rm.getCurrentRoundId();
+                    if (!roundId) continue;
+
+                    const betResult = await betManager.processBet({
+                        playerId: randomBot.id,
+                        roundId: roundId,
+                        tableId: tableId,
+                        betEndTime: rm.getBetEndTime(),
+                        data: {
+                            area: randomArea,
+                            amount: randomAmount,
+                            betId: `botbet_${Date.now()}_${Math.random()}`
+                        }
+                    });
+
+                    if (betResult.success) {
+                        const newBalance = await walletService.getBalance(randomBot.id);
+                        ts.recordBet(randomBot.id, randomArea, randomAmount);
+                        ts.updateBalance(randomBot.id, newBalance);
+                        ts.broadcastBetTotals();
+                        ts.broadcastBetPlaced(randomBot.id, randomBot.name, randomArea, randomAmount);
+                        ts.broadcastPlayerState();
+                        logger.debug(`Bot ${randomBot.name} bet ${randomAmount} on ${randomArea}`);
+                    }
+                }
+            }
+        } catch (err) {
+            logger.error('Bot Engine Error', { error: err.message });
+        }
+    }, 1500); // Check every 1.5 seconds
+}
+
+function shutdown() {
+    if (botInterval) clearInterval(botInterval);
+}
+
+module.exports = { init, shutdown };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\game\resultEngine.js 
+// ========================================== 
+
+'use strict';
+
+// Payout multipliers (return on winner bet, including stake)
+const PAYOUT_MULTIPLIERS = {
+    dragon: 2,   // 1:1 payout â†’ returns 2x stake
+    tiger: 2,    // 1:1 payout â†’ returns 2x stake
+    tie: 9,      // 8:1 payout â†’ returns 9x stake
+};
+
+/**
+ * Determine the winner of a round.
+ * @param {number} dragonCard
+ * @param {number} tigerCard
+ * @returns {'dragon'|'tiger'|'tie'}
+ */
+function determineWinner(dragonCard, tigerCard) {
+    if (dragonCard > tigerCard) return 'dragon';
+    if (tigerCard > dragonCard) return 'tiger';
+    return 'tie';
+}
+
+/**
+ * Calculate the payout for a winning bet.
+ * Returns 0 for losing bets.
+ * @param {string} betArea - 'dragon' | 'tiger' | 'tie'
+ * @param {string} winner  - 'dragon' | 'tiger' | 'tie'
+ * @param {number} betAmount
+ * @returns {number} Total payout (including returned stake). 0 if bet lost.
+ */
+function calculatePayout(betArea, winner, betAmount) {
+    if (betArea !== winner) return 0;
+    return parseFloat((betAmount * PAYOUT_MULTIPLIERS[betArea]).toFixed(2));
+}
+
+module.exports = { determineWinner, calculatePayout, PAYOUT_MULTIPLIERS };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\game\rngService.js 
+// ========================================== 
+
+'use strict';
+
+const { randomInt, randomBytes, createHash } = require('crypto');
+
+/**
+ * Generate a cryptographically secure card value (1â€“13).
+ */
+function generateCard() {
+  return randomInt(1, 14); // [1, 14) â†’ 1..13
+}
+
+/**
+ * Generate cards + a provably fair commitment.
+ *
+ * How it works:
+ *   1. Generate dragonCard and tigerCard using CSPRNG.
+ *   2. Generate a random 32-byte nonce (kept secret until result reveal).
+ *   3. Compute commitmentHash = SHA256("dragonCard:tigerCard:nonce")
+ *   4. Publish ONLY commitmentHash to players before betting opens.
+ *   5. After result, publish dragonCard + tigerCard + nonce.
+ *   6. Anyone can verify: SHA256(dragonCard + ':' + tigerCard + ':' + nonce) === commitmentHash
+ *
+ * This proves the server could NOT have changed the result after seeing bets.
+ */
+function generateRoundCommitment() {
+  const dragonCard = generateCard();
+  const tigerCard  = generateCard();
+  const nonce      = randomBytes(32).toString('hex'); // 64-char hex string
+
+  const payload        = `${dragonCard}:${tigerCard}:${nonce}`;
+  const commitmentHash = createHash('sha256').update(payload).digest('hex');
+
+  return { dragonCard, tigerCard, nonce, commitmentHash };
+}
+
+/**
+ * Verify a commitment (utility â€” used by the /verify endpoint).
+ */
+function verifyCommitment({ dragonCard, tigerCard, nonce, commitmentHash }) {
+  const payload  = `${dragonCard}:${tigerCard}:${nonce}`;
+  const expected = createHash('sha256').update(payload).digest('hex');
+  return expected === commitmentHash;
+}
+
+/**
+ * Human-readable card label.
+ */
+function cardLabel(value) {
+  const labels = { 1: 'A', 11: 'J', 12: 'Q', 13: 'K' };
+  return labels[value] || String(value);
+}
+
+module.exports = { generateRoundCommitment, verifyCommitment, cardLabel };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\game\roundManager.js 
+// ========================================== 
+
+'use strict';
+
+const EventEmitter = require('events');
+const { getClient } = require('../config/redis');
+const roundModel = require('../models/roundModel');
+const betModel = require('../models/betModel');
+const ledgerService = require('../wallet/ledgerService');
+const walletService = require('../wallet/walletService');
+const { generateRoundCommitment, cardLabel } = require('./rngService');
+const { determineWinner, calculatePayout } = require('./resultEngine');
+const TimerService = require('../services/timerService');
+const { game } = require('../config/environment');
+const logger = require('../utils/logger');
+
+const PHASE = {
+  ROUND_INITIALIZATION: 'ROUND_INITIALIZATION',
+  BETTING_OPEN:         'BETTING_OPEN',
+  BETTING_CLOSE:        'BETTING_CLOSE',
+  RESULT_REVEAL:        'RESULT_REVEAL',
+  PAYOUT:               'PAYOUT',
+  ROUND_COMPLETE:       'ROUND_COMPLETE',
+};
+
+class RoundManager extends EventEmitter {
+  constructor(tableId) {
+    super();
+    this.tableId = tableId;
+    this.timer   = new TimerService();
+    this.currentRound = null;
+    this._running     = false;
+  }
+
+  start() {
+    if (this._running) return;
+    this._running = true;
+    logger.info('RoundManager started', { tableId: this.tableId });
+    this._runPhase(PHASE.ROUND_INITIALIZATION);
+  }
+
+  stop() { this._running = false; this.timer.stop(); }
+
+  async getStateSnapshot() {
+    const redis = await getClient();
+    const raw   = await redis.get(`table:${this.tableId}:round`);
+    return raw ? JSON.parse(raw) : null;
+  }
+
+  getBetEndTime()    { return this.timer.getEndTime(); }
+  getCurrentRoundId(){ return this.currentRound ? this.currentRound.roundId : null; }
+
+  // â”€â”€ Phase state machine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  _runPhase(phase) {
+    if (!this._running) return;
+    logger.debug('Round phase', { tableId: this.tableId, phase });
+    switch (phase) {
+      case PHASE.ROUND_INITIALIZATION: return this._phaseInit();
+      case PHASE.BETTING_OPEN:         return this._phaseBettingOpen();
+      case PHASE.BETTING_CLOSE:        return this._phaseBettingClose();
+      case PHASE.RESULT_REVEAL:        return this._phaseResultReveal();
+      case PHASE.PAYOUT:               return this._phasePayouts();
+      case PHASE.ROUND_COMPLETE:       return this._phaseComplete();
+    }
+  }
+
+  async _phaseInit() {
+    try {
+      // Generate cards AND the provably-fair commitment in one step
+      const { dragonCard, tigerCard, nonce, commitmentHash } = generateRoundCommitment();
+
+      const dbRound = await roundModel.createRound({ tableId: this.tableId, commitmentHash });
+
+      this.currentRound = {
+        roundId: dbRound.round_id,
+        tableId: this.tableId,
+        dragonCard,
+        tigerCard,
+        nonce,          // kept secret until RESULT_REVEAL
+        commitmentHash, // published immediately on BETTING_OPEN
+        phase: PHASE.ROUND_INITIALIZATION,
+        startedAt: Date.now(),
+      };
+
+      // Save to Redis (cards & nonce are _secret â€” not broadcast)
+      await this._saveToRedis({ ...this.currentRound, _secret: true });
+
+      this.emit('phase', { phase: PHASE.ROUND_INITIALIZATION, tableId: this.tableId });
+      this._runPhase(PHASE.BETTING_OPEN);
+
+    } catch (err) {
+      logger.error('Round init failed, retrying in 5s', { tableId: this.tableId, error: err.message });
+      setTimeout(() => this._runPhase(PHASE.ROUND_INITIALIZATION), 5000);
+    }
+  }
+
+  _phaseBettingOpen() {
+    const { commitmentHash, roundId } = this.currentRound;
+    const bettingEndsAt = Date.now() + game.bettingPhaseDuration;
+    this.currentRound.phase = PHASE.BETTING_OPEN;
+
+    // âœ… Publish the commitment hash â€” proves cards are already fixed
+    this.emit('phase', {
+      event: 'roundStart',
+      data: {
+        phase: PHASE.BETTING_OPEN,
+        tableId:      this.tableId,
+        roundId,
+        bettingEndsAt,
+        commitmentHash,  // SHA256(dragonCard:tigerCard:nonce) â€” verifiable after reveal
+      }
+    });
+
+    this.timer.start(
+      game.bettingPhaseDuration,
+      (remaining) => {
+        // Broadcast standard timerUpdate
+        this.emit('tick', {
+           event: 'timerUpdate',
+           data: { timeRemaining: remaining }
+        });
+      },
+      () => this._runPhase(PHASE.BETTING_CLOSE)
+    );
+  }
+
+  _phaseBettingClose() {
+    this.currentRound.phase = PHASE.BETTING_CLOSE;
+    this.emit('phase', { phase: PHASE.BETTING_CLOSE, tableId: this.tableId });
+    setTimeout(() => this._runPhase(PHASE.RESULT_REVEAL), 500);
+  }
+
+  async _phaseResultReveal() {
+    const { dragonCard, tigerCard, nonce, commitmentHash, roundId } = this.currentRound;
+    const winner = determineWinner(dragonCard, tigerCard);
+
+    await roundModel.updateRoundResult({ roundId, dragonCard, tigerCard, winner, nonce });
+    this.currentRound.winner = winner;
+    this.currentRound.phase  = PHASE.RESULT_REVEAL;
+
+    // âœ… Reveal cards + nonce â€” anyone can now verify the hash themselves
+    this.emit('phase', {
+      event: 'roundResult',
+      data: {
+        phase: PHASE.RESULT_REVEAL,
+        tableId:        this.tableId,
+        roundId,
+        dragonCard,
+        dragonLabel:    cardLabel(dragonCard),
+        tigerCard,
+        tigerLabel:     cardLabel(tigerCard),
+        winner,
+        // Provably fair reveal packet
+        proof: {
+          nonce,
+          commitmentHash,
+          // How to verify: SHA256(`${dragonCard}:${tigerCard}:${nonce}`) === commitmentHash
+          verifyUrl: `/verify/${roundId}`,
+        },
+      }
+    });
+
+    this.timer.start(game.revealPhaseDuration, null, () => this._runPhase(PHASE.PAYOUT));
+  }
+
+  async _phasePayouts() {
+    const { roundId, winner, tableId } = this.currentRound;
+    this.currentRound.phase = PHASE.PAYOUT;
+
+    try {
+      const bets = await betModel.getBetsForRound(roundId);
+      const payoutSummary = [];
+
+      for (const bet of bets) {
+        const payout = calculatePayout(bet.bet_area, winner, parseFloat(bet.amount));
+        if (payout > 0) {
+          await ledgerService.creditEntry(bet.player_id, payout, bet.bet_id, 'payout');
+          await betModel.updateBetStatus(bet.bet_id, 'won');
+        } else {
+          await betModel.updateBetStatus(bet.bet_id, 'lost');
+        }
+        const newBalance = await walletService.getBalance(bet.player_id);
+        payoutSummary.push({ playerId: bet.player_id, betArea: bet.bet_area, amount: parseFloat(bet.amount), payout, newBalance });
+      }
+
+      logger.info('Payouts distributed', { roundId, tableId, betsCount: bets.length });
+      this.emit('phase', { phase: PHASE.PAYOUT, tableId, roundId, winner, payoutSummary });
+    } catch (err) {
+      logger.error('Payout phase error', { roundId, error: err.message });
+    }
+
+    const redis = await getClient();
+    await redis.del(`table:${tableId}:bets`);
+    this.timer.start(game.settlementPhaseDuration, null, () => this._runPhase(PHASE.ROUND_COMPLETE));
+  }
+
+  _phaseComplete() {
+    logger.info('Round complete', { tableId: this.tableId, roundId: this.currentRound.roundId });
+    this.emit('phase', { phase: PHASE.ROUND_COMPLETE, tableId: this.tableId, roundId: this.currentRound.roundId });
+    this.currentRound = null;
+    setImmediate(() => this._runPhase(PHASE.ROUND_INITIALIZATION));
+  }
+
+  async _saveToRedis(state) {
+    const redis = await getClient();
+    await redis.set(`table:${this.tableId}:round`, JSON.stringify(state), { EX: 300 });
+  }
+}
+
+module.exports = { RoundManager, PHASE };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\game\tableManager.js 
+// ========================================== 
+
+'use strict';
+
+const { RoundManager } = require('./roundManager');
+const { TableState }   = require('./tableState');
+const { game } = require('../config/environment');
+const logger = require('../utils/logger');
+
+class TableManager {
+  constructor() {
+    this._tables    = new Map();
+    this._nextTableId = 1;
+    this._io = null;
+  }
+
+  init(io) {
+    this._io = io;
+    this._createTable();
+  }
+
+  // â”€â”€ Create a table with its own RoundManager + TableState â”€â”€
+  _createTable() {
+    const tableId  = `table_${this._nextTableId++}`;
+    const rm       = new RoundManager(tableId);
+    const state    = new TableState(tableId, this._io);
+
+    const table = { tableId, roundManager: rm, state };
+    this._tables.set(tableId, table);
+
+    // Forward round phase events to the room
+    rm.on('phase', (event) => {
+      if (!this._io) return;
+
+      // On new round â€” reset bet pools and player bet tracking
+      if (event.phase === 'ROUND_INITIALIZATION') {
+        state.resetRound();
+        state.broadcastBetTotals();
+        state.broadcastPlayerState();
+      }
+
+      // On result â€” push winner to server-authoritative round history
+      if (event.phase === 'RESULT_REVEAL' && event.winner) {
+        state.pushHistory(event.winner, event.dragonLabel, event.tigerLabel);
+      }
+
+      // On payout - push balanceUpdate events and refresh players
+      if (event.phase === 'PAYOUT' && event.payoutSummary) {
+        for (const p of event.payoutSummary) {
+          state.updateBalance(p.playerId, p.newBalance);
+          this._io.to(tableId).emit('balanceUpdate', {
+            playerId: p.playerId,
+            balance: p.newBalance
+          });
+        }
+        state.broadcastPlayerState();
+      }
+
+      if (event.event) {
+        // Already wrapped by roundManager (e.g., roundStart, roundResult)
+        this._io.to(tableId).emit(event.event, event.data);
+      } else {
+        // Fallback for older phase events
+        this._io.to(tableId).emit(event.phase, event);
+      }
+    });
+
+    rm.on('tick', (event) => {
+      if (this._io && event.event) {
+        this._io.to(tableId).emit(event.event, event.data);
+      }
+    });
+
+    rm.start();
+    logger.info('Table created', { tableId });
+    return table;
+  }
+
+  // â”€â”€ Player lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  async assignPlayer(playerId, username, balance, socketId) {
+    // Find a table with capacity
+    let table = null;
+    for (const t of this._tables.values()) {
+      if (t.state.getPlayerCount() < game.maxPlayersPerTable) { table = t; break; }
+    }
+    if (!table) table = this._createTable(); // overflow
+
+    const tableId = table.tableId;
+    table.state.upsertPlayer({ playerId, username, balance, socketId });
+
+    logger.info('Player assigned', { playerId, tableId, total: table.state.getPlayerCount() });
+    return tableId;
+  }
+
+  updatePlayer(playerId, { balance, socketId }) {
+    for (const t of this._tables.values()) {
+      const p = t.state._players.get(playerId);
+      if (p) {
+        if (balance !== undefined) p.balance = parseFloat(balance) || 0;
+        if (socketId)              p.socketId = socketId;
+        t.state.setConnected(playerId, socketId || p.socketId);
+        return t.tableId;
+      }
+    }
+    return null;
+  }
+
+  markDisconnected(playerId) {
+    for (const t of this._tables.values()) {
+      if (t.state._players.has(playerId)) {
+        t.state.setDisconnected(playerId);
+        return t.tableId;
+      }
+    }
+    return null;
+  }
+
+  removePlayer(playerId) {
+    for (const [tableId, t] of this._tables) {
+      if (t.state._players.has(playerId)) {
+        t.state.removePlayer(playerId);
+        logger.info('Player removed', { playerId, tableId });
+        return tableId;
+      }
+    }
+    return null;
+  }
+
+  updatePlayerBalance(playerId, balance) {
+    for (const t of this._tables.values()) {
+      if (t.state._players.has(playerId)) {
+        t.state.updateBalance(playerId, balance);
+        return;
+      }
+    }
+  }
+
+  getPlayerTable(playerId) {
+    for (const [tableId, t] of this._tables) {
+      if (t.state._players.has(playerId)) return tableId;
+    }
+    return null;
+  }
+
+  getTable(tableId) { return this._tables.get(tableId) || null; }
+
+  getRoundManager(tableId) {
+    const t = this._tables.get(tableId);
+    return t ? t.roundManager : null;
+  }
+
+  getTableState(tableId) {
+    const t = this._tables.get(tableId);
+    return t ? t.state : null;
+  }
+
+  listTables() {
+    return [...this._tables.values()].map(t => ({
+      tableId: t.tableId,
+      playerCount: t.state.getPlayerCount(),
+    }));
+  }
+}
+
+module.exports = new TableManager();
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\game\tableState.js 
+// ========================================== 
+
+'use strict';
+
+const logger = require('../utils/logger');
+
+const MAX_VISIBLE = 5;
+const ROTATION_INTERVAL_MS = 30_000;
+
+// Avatar options (emoji index â†’ client renders icon)
+const AVATARS = ['ðŸ‰', 'ðŸ¯', 'ðŸ¦', 'ðŸ»', 'ðŸ¦Š', 'ðŸº', 'ðŸ¦…', 'ðŸŒŠ'];
+
+function avatarFor(playerId) {
+  let hash = 0;
+  for (const c of String(playerId)) hash = (hash * 31 + c.charCodeAt(0)) & 0xffff;
+  return hash % AVATARS.length;
+}
+
+/**
+ * In-memory state for a single game table.
+ * Tracks all connected players, bet pools, per-player bets, and visible player list.
+ */
+class TableState {
+  constructor(tableId, io) {
+    this.tableId  = tableId;
+    this._io      = io;
+
+    /** @type {Map<string, PlayerRecord>} all players on the table */
+    this._players = new Map();
+
+    /** Bet totals across all players for the current round */
+    this.betTotals = { dragon: 0, tiger: 0, tie: 0 };
+
+    /** Per-player bets: playerId â†’ [{area, amount}] */
+    this._roundBets = new Map();
+
+    /** Ordered list of up to 7 visible player IDs */
+    this._visibleIds = [];
+
+    /** Round result history â€” last 12 rounds, server-authoritative */
+    this._history = [];
+
+    this._rotationTimer = null;
+    this._startRotation();
+  }
+
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+  // Player management
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+  /**
+   * Add or update a player record.
+   */
+  upsertPlayer({ playerId, username, balance, socketId }) {
+    const existing = this._players.get(playerId);
+    const avatarIdx = existing ? existing.avatarIdx : avatarFor(playerId);
+    const record = {
+      playerId,
+      username,
+      balance:         parseFloat(balance) || 0,
+      socketId,
+      avatarIdx,
+      currentBets:     existing ? existing.currentBets : { dragon: 0, tiger: 0, tie: 0 },
+      isVisible:       false,
+      connectionStatus:'connected',
+      connectedAt:     existing ? existing.connectedAt : Date.now(),
+      lastBetAt:       existing ? existing.lastBetAt : 0,
+    };
+    this._players.set(playerId, record);
+    this._recalcVisible();
+    return record;
+  }
+
+  setDisconnected(playerId) {
+    const p = this._players.get(playerId);
+    if (p) { p.connectionStatus = 'disconnected'; }
+  }
+
+  setConnected(playerId, socketId) {
+    const p = this._players.get(playerId);
+    if (p) { p.connectionStatus = 'connected'; p.socketId = socketId; }
+  }
+
+  removePlayer(playerId) {
+    this._players.delete(playerId);
+    this._recalcVisible();
+  }
+
+  updateBalance(playerId, balance) {
+    const p = this._players.get(playerId);
+    if (p) p.balance = parseFloat(balance) || 0;
+  }
+
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+  // Bet tracking
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+  /**
+   * Record a confirmed bet from the server. Updates pool totals and per-player bets.
+   * Returns the updated betTotals.
+   */
+  recordBet(playerId, area, amount) {
+    const amt = parseFloat(amount);
+    // Pool totals
+    this.betTotals[area] = (this.betTotals[area] || 0) + amt;
+    // Per-player bets
+    if (!this._roundBets.has(playerId)) this._roundBets.set(playerId, []);
+    this._roundBets.get(playerId).push({ area, amount: amt });
+    // Player current bets
+    const p = this._players.get(playerId);
+    if (p) {
+      p.currentBets[area] = (p.currentBets[area] || 0) + amt;
+      p.lastBetAt = Date.now();
+    }
+    // Re-evaluate visible (bettors get priority)
+    this._recalcVisible();
+    return { ...this.betTotals };
+  }
+
+  /**
+   * Push a round result to the history queue (max 12 entries, server-authoritative).
+   */
+  pushHistory(winner, dragonLabel, tigerLabel) {
+    this._history.push({ winner, dragonLabel, tigerLabel, ts: Date.now() });
+    if (this._history.length > 12) this._history.shift();
+    // Broadcast updated history to all players in the room
+    this._io.to(this.tableId).emit('ROUND_HISTORY', { history: this.getHistory() });
+  }
+
+  getHistory() { return [...this._history]; }
+
+  /**
+   * Reset all bet state between rounds.
+   */
+  resetRound() {
+    this.betTotals = { dragon: 0, tiger: 0, tie: 0 };
+    this._roundBets.clear();
+    for (const p of this._players.values()) {
+      p.currentBets = { dragon: 0, tiger: 0, tie: 0 };
+      p.lastBetAt   = 0;
+    }
+    this._recalcVisible();
+  }
+
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+  // Visible player list
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+  _recalcVisible(currentPlayerId) {
+    const all = [...this._players.values()];
+    const now = Date.now();
+    const RECENT_BET_WINDOW = 30_000; // 30s
+
+    // Candidates: sort by (recent bettor first, then highest balance)
+    const scored = all.map(p => ({
+      p,
+      score: (now - p.lastBetAt < RECENT_BET_WINDOW ? 1000 : 0) + p.balance / 1_000_000,
+    })).sort((a, b) => b.score - a.score);
+
+    // Reset isVisible
+    all.forEach(p => { p.isVisible = false; });
+
+    // Pick top MAX_VISIBLE; always keep currentPlayerId if provided
+    let chosen = [];
+    if (currentPlayerId && this._players.has(currentPlayerId)) {
+      chosen.push(currentPlayerId);
+      this._players.get(currentPlayerId).isVisible = true;
+    }
+
+    for (const { p } of scored) {
+      if (chosen.length >= MAX_VISIBLE) break;
+      if (chosen.includes(p.playerId)) continue;
+      p.isVisible = true;
+      chosen.push(p.playerId);
+    }
+
+    this._visibleIds = chosen;
+  }
+
+  getVisiblePlayers() {
+    return this._visibleIds
+      .map(id => this._players.get(id))
+      .filter(Boolean)
+      .map((p, i) => ({
+        playerId:   p.playerId,
+        username:   p.username,
+        balance:    p.balance,
+        avatarIdx:  p.avatarIdx,
+        seatIndex:  i,             // 0-6 â†’ client maps to seat positions
+        currentBets:p.currentBets,
+        connectionStatus: p.connectionStatus,
+      }));
+  }
+
+  getPlayerCount() { return this._players.size; }
+
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+  // Broadcasts
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+  broadcastBetTotals() {
+    this._io.to(this.tableId).emit('poolUpdate', { // Ensure to use the requested format
+      dragonAmount: this.betTotals.dragon,
+      tigerAmount:  this.betTotals.tiger,
+      tieAmount:    this.betTotals.tie,
+    });
+  }
+
+  broadcastPlayerState() {
+    this._io.to(this.tableId).emit('playersUpdate', {
+      visiblePlayers: this.getVisiblePlayers(),
+      totalPlayers: this._players.size,
+    });
+  }
+
+  /** Emit PLAYER_BET to the table so others can animate the chip */
+  broadcastBetPlaced(playerId, username, area, amount) {
+    this._io.to(this.tableId).emit('betPlaced', { playerId, username, area, amount });
+  }
+
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+  // Rotation
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+  _startRotation() {
+    this._rotationTimer = setInterval(() => {
+      if (this._players.size <= MAX_VISIBLE) return; // no need to rotate if few players
+      this._recalcVisible();
+      this.broadcastPlayerState();
+      logger.debug('Visible player rotation', { tableId: this.tableId, visible: this._visibleIds.length });
+    }, ROTATION_INTERVAL_MS);
+  }
+
+  destroy() {
+    if (this._rotationTimer) clearInterval(this._rotationTimer);
+  }
+}
+
+module.exports = { TableState };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\models\betModel.js 
+// ========================================== 
+
+'use strict';
+
+const logger = require('../utils/logger');
+
+// In-Memory Bet Store: Array of bet objects
+const demoBets = [];
+
+/**
+ * Create a bet record.
+ */
+async function createBet({ clientBetId, playerId, roundId, betArea, amount }) {
+    const bet = {
+        bet_id: `bet_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
+        client_bet_id: clientBetId,
+        player_id: playerId,
+        round_id: roundId,
+        bet_area: betArea,
+        amount: amount,
+        status: 'active',
+        created_at: new Date().toISOString()
+    };
+    
+    demoBets.push(bet);
+    return bet;
+}
+
+/**
+ * Get all bets for a given round.
+ */
+async function getBetsForRound(roundId) {
+    return demoBets.filter(b => b.round_id === roundId);
+}
+
+/**
+ * Get all bets placed by a player in a specific round.
+ */
+async function getPlayerBetsForRound(playerId, roundId) {
+    return demoBets.filter(b => b.player_id === playerId && b.round_id === roundId);
+}
+
+/**
+ * Update bet status (won/lost/refunded).
+ */
+async function updateBetStatus(betId, status) {
+    const bet = demoBets.find(b => b.bet_id === betId);
+    if (bet) {
+        bet.status = status;
+    }
+}
+
+module.exports = { createBet, getBetsForRound, getPlayerBetsForRound, updateBetStatus };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\models\roundModel.js 
+// ========================================== 
+
+'use strict';
+
+// In-Memory Rounds Store: Array of round objects
+const demoRounds = [];
+
+async function createRound({ tableId, commitmentHash }) {
+    const round = {
+        round_id: `round_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
+        table_id: tableId,
+        commitment_hash: commitmentHash,
+        status: 'active',
+        created_at: new Date().toISOString()
+    };
+    demoRounds.push(round);
+    return round;
+}
+
+/**
+ * Persist result and reveal the nonce (completes the commit-reveal).
+ */
+async function updateRoundResult({ roundId, dragonCard, tigerCard, winner, nonce }) {
+    const round = demoRounds.find(r => r.round_id === roundId);
+    if (round) {
+        round.dragon_card = dragonCard;
+        round.tiger_card = tigerCard;
+        round.winner = winner;
+        round.server_nonce = nonce;
+        round.status = 'complete';
+    }
+    return round;
+}
+
+async function getActiveRound(tableId) {
+    // Find the most recently added active round for this table
+    const activeRounds = demoRounds.filter(r => r.table_id === tableId && r.status === 'active');
+    return activeRounds.length > 0 ? activeRounds[activeRounds.length - 1] : null;
+}
+
+/**
+ * Fetch a completed round by ID for provably-fair verification.
+ */
+async function getRoundById(roundId) {
+    return demoRounds.find(r => r.round_id === roundId) || null;
+}
+
+module.exports = { createRound, updateRoundResult, getActiveRound, getRoundById };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\models\transactionModel.js 
+// ========================================== 
+
+'use strict';
+
+const { query } = require('../config/database');
+
+/**
+ * Create a payment transaction record.
+ */
+async function createTransaction({ playerId, amount }) {
+    const result = await query(
+        `INSERT INTO payment_transactions (player_id, amount, status)
+     VALUES ($1, $2, 'pending')
+     RETURNING transaction_id, player_id, amount, status, created_at`,
+        [playerId, amount]
+    );
+    return result.rows[0];
+}
+
+/**
+ * Update the status of a payment transaction.
+ */
+async function updateTransactionStatus(transactionId, status) {
+    const result = await query(
+        `UPDATE payment_transactions SET status = $1 WHERE transaction_id = $2 RETURNING *`,
+        [status, transactionId]
+    );
+    return result.rows[0];
+}
+
+module.exports = { createTransaction, updateTransactionStatus };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\models\userModel.js 
+// ========================================== 
+
+'use strict';
+
+// In-Memory User Store: Map<email, user>
+const demoUsers = new Map();
+const demoUsersById = new Map();
+
+/**
+ * Find a user by email.
+ */
+async function findByEmail(email) {
+    return demoUsers.get(email) || null;
+}
+
+/**
+ * Find a user by ID.
+ */
+async function findById(id) {
+    return demoUsersById.get(id) || null;
+}
+
+/**
+ * Create a new user record.
+ */
+async function create({ email, username, passwordHash }) {
+    const id = `user_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const user = {
+        id,
+        email,
+        username,
+        password_hash: passwordHash,
+        created_at: new Date().toISOString()
+    };
+    demoUsers.set(email, user);
+    demoUsersById.set(id, user);
+    return user;
+}
+
+module.exports = { findByEmail, findById, create };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\payment\paymentDemo.js 
+// ========================================== 
+
+'use strict';
+
+const transactionModel = require('../models/transactionModel');
+const ledgerService = require('../wallet/ledgerService');
+const walletService = require('../wallet/walletService');
+const validationService = require('../services/validationService');
+const { authenticateToken } = require('../auth/jwtMiddleware');
+const logger = require('../utils/logger');
+const express = require('express');
+
+const router = express.Router();
+
+/**
+ * POST /deposit
+ * Protected route â€” requires valid JWT.
+ *
+ * Simulates a payment gateway flow:
+ *   1. Create transaction (pending)
+ *   2. Simulate 2s processing delay
+ *   3. Mark transaction success
+ *   4. Write ledger deposit entry
+ *   5. Return new balance
+ */
+router.post('/', authenticateToken, async (req, res) => {
+    const { error, value } = validationService.validateDeposit(req.body);
+    if (error) {
+        return res.status(400).json({ error: error.details[0].message });
+    }
+
+    const { playerId } = req.user;
+    const { amount } = value;
+
+    try {
+        // 1. Create pending transaction
+        const tx = await transactionModel.createTransaction({ playerId, amount });
+        logger.info('Deposit initiated', { playerId, amount, transactionId: tx.transaction_id });
+
+        // 2. Simulate processing delay (2 seconds)
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+
+        // 3. Mark as success
+        await transactionModel.updateTransactionStatus(tx.transaction_id, 'success');
+
+        // 4. Write ledger credit
+        await ledgerService.deposit(playerId, amount, tx.transaction_id);
+
+        // 5. Return new balance
+        const balance = await walletService.getBalance(playerId);
+
+        logger.info('Deposit completed', { playerId, amount, transactionId: tx.transaction_id, balance });
+        return res.status(200).json({ success: true, transactionId: tx.transaction_id, balance });
+
+    } catch (err) {
+        logger.error('Deposit failed', { playerId, amount, error: err.message });
+        return res.status(500).json({ error: 'Deposit processing failed' });
+    }
+});
+
+module.exports = router;
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\routes\verifyRoute.js 
+// ========================================== 
+
+'use strict';
+
+const express = require('express');
+const { getRoundById } = require('../models/roundModel');
+const { verifyCommitment } = require('../game/rngService');
+const logger = require('../utils/logger');
+
+const router = express.Router();
+
+/**
+ * GET /verify/:roundId
+ *
+ * Public endpoint â€” anyone can verify a completed round.
+ *
+ * Returns:
+ *   {
+ *     roundId, dragonCard, tigerCard, winner,
+ *     commitmentHash, nonce,
+ *     verified: true/false,
+ *     howToVerify: "SHA256(dragonCard:tigerCard:nonce) === commitmentHash"
+ *   }
+ */
+router.get('/:roundId', async (req, res) => {
+  try {
+    const round = await getRoundById(req.params.roundId);
+
+    if (!round) {
+      return res.status(404).json({ error: 'Round not found' });
+    }
+
+    if (!round.server_nonce) {
+      return res.status(202).json({ message: 'Round not yet complete â€” nonce will be available after reveal' });
+    }
+
+    const verified = verifyCommitment({
+      dragonCard:     round.dragon_card,
+      tigerCard:      round.tiger_card,
+      nonce:          round.server_nonce,
+      commitmentHash: round.commitment_hash,
+    });
+
+    logger.info('Round verified', { roundId: round.round_id, verified });
+
+    return res.json({
+      roundId:        round.round_id,
+      dragonCard:     round.dragon_card,
+      tigerCard:      round.tiger_card,
+      winner:         round.winner,
+      commitmentHash: round.commitment_hash,
+      nonce:          round.server_nonce,
+      verified,
+      howToVerify: 'SHA256(`${dragonCard}:${tigerCard}:${nonce}`) must equal commitmentHash',
+      createdAt:   round.created_at,
+    });
+
+  } catch (err) {
+    logger.error('Verify endpoint error', { error: err.message });
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+module.exports = router;
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\services\timerService.js 
+// ========================================== 
+
+'use strict';
+
+/**
+ * Server-authoritative countdown timer.
+ */
+class TimerService {
+    constructor() {
+        this._handle = null;
+        this._endTime = null;
+        this._remaining = 0;
+    }
+
+    /**
+     * Start a countdown timer.
+     * @param {number} durationMs - Total duration in milliseconds
+     * @param {function} onTick   - Called every second with remaining ms
+     * @param {function} onComplete - Called when timer reaches 0
+     */
+    start(durationMs, onTick, onComplete) {
+        this.stop(); // cancel any existing timer
+        this._endTime = Date.now() + durationMs;
+        this._remaining = durationMs;
+
+        this._handle = setInterval(() => {
+            this._remaining = Math.max(0, this._endTime - Date.now());
+            if (typeof onTick === 'function') onTick(this._remaining);
+
+            if (this._remaining <= 0) {
+                this.stop();
+                if (typeof onComplete === 'function') onComplete();
+            }
+        }, 1000);
+    }
+
+    stop() {
+        if (this._handle) {
+            clearInterval(this._handle);
+            this._handle = null;
+        }
+    }
+
+    /** Get remaining ms (useful for reconnect state sync). */
+    getRemaining() {
+        if (!this._endTime) return 0;
+        return Math.max(0, this._endTime - Date.now());
+    }
+
+    /** Get the absolute epoch ms when this timer ends. */
+    getEndTime() {
+        return this._endTime;
+    }
+}
+
+module.exports = TimerService;
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\services\validationService.js 
+// ========================================== 
+
+'use strict';
+
+const Joi = require('joi');
+
+const registrationSchema = Joi.object({
+    email: Joi.string().email().required(),
+    username: Joi.string().alphanum().min(3).max(30).required(),
+    password: Joi.string().min(8).max(72).required(),
+});
+
+const loginSchema = Joi.object({
+    email: Joi.string().email().required(),
+    password: Joi.string().required(),
+});
+
+const betSchema = Joi.object({
+    type: Joi.string().valid('PLACE_BET').required(),
+    betId: Joi.string().min(1).max(100).required(),
+    area: Joi.string().valid('dragon', 'tiger', 'tie').required(),
+    amount: Joi.number().positive().required(),
+    timestamp: Joi.number().integer().required(),
+});
+
+const depositSchema = Joi.object({
+    amount: Joi.number().positive().max(100000).required(),
+});
+
+function validateRegistration(data) {
+    return registrationSchema.validate(data);
+}
+
+function validateLogin(data) {
+    return loginSchema.validate(data);
+}
+
+function validateBetMessage(data) {
+    return betSchema.validate(data);
+}
+
+function validateDeposit(data) {
+    return depositSchema.validate(data);
+}
+
+module.exports = { validateRegistration, validateLogin, validateBetMessage, validateDeposit };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\utils\logger.js 
+// ========================================== 
+
+'use strict';
+
+const winston = require('winston');
+const path = require('path');
+const { nodeEnv } = require('../config/environment');
+
+const logDir = path.join(process.cwd(), 'logs');
+
+const logger = winston.createLogger({
+    level: nodeEnv === 'production' ? 'info' : 'debug',
+    format: winston.format.combine(
+        winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss.SSS' }),
+        winston.format.errors({ stack: true }),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.File({
+            filename: path.join(logDir, 'error.log'),
+            level: 'error',
+            maxsize: 10 * 1024 * 1024, // 10 MB
+            maxFiles: 5,
+        }),
+        new winston.transports.File({
+            filename: path.join(logDir, 'combined.log'),
+            maxsize: 20 * 1024 * 1024, // 20 MB
+            maxFiles: 10,
+        }),
+    ],
+});
+
+if (nodeEnv !== 'production') {
+    logger.add(
+        new winston.transports.Console({
+            format: winston.format.combine(
+                winston.format.colorize(),
+                winston.format.printf(({ timestamp, level, message, ...meta }) => {
+                    const metaStr = Object.keys(meta).length ? ' ' + JSON.stringify(meta) : '';
+                    return `${timestamp} [${level}]: ${message}${metaStr}`;
+                })
+            ),
+        })
+    );
+}
+
+module.exports = logger;
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\wallet\ledgerService.js 
+// ========================================== 
+
+'use strict';
+
+const walletService = require('./walletService');
+const logger = require('../utils/logger');
+
+/**
+ * Lock funds for a bet. Stores a NEGATIVE amount (debit).
+ * @param {string} playerId
+ * @param {number} amount  - positive value; stored as negative
+ * @param {string} betId   - reference to the bet
+ */
+async function lockBet(playerId, amount, betId) {
+    const currentBalance = await walletService.getBalance(playerId);
+    const newBalance = currentBalance - Math.abs(amount);
+    await walletService.updateBalance(playerId, newBalance);
+    
+    logger.info('Ledger: bet_lock', { playerId, amount: -Math.abs(amount), betId });
+    return { playerId, type: 'bet_lock', amount: -Math.abs(amount), newBalance };
+}
+
+/**
+ * Release a locked bet (e.g., on loss or refund) or Payout a winner.
+ * Returns the locked amount as a POSITIVE credit.
+ * @param {string} playerId
+ * @param {number} amount  - amount to add (positive)
+ * @param {string} betId
+ * @param {string} [type='bet_release'] - 'bet_release' | 'payout'
+ */
+async function creditEntry(playerId, amount, betId, type = 'bet_release') {
+    const currentBalance = await walletService.getBalance(playerId);
+    const newBalance = currentBalance + Math.abs(amount);
+    await walletService.updateBalance(playerId, newBalance);
+
+    logger.info(`Ledger: ${type}`, { playerId, amount: Math.abs(amount), betId });
+    return { playerId, type, amount: Math.abs(amount), newBalance };
+}
+
+/**
+ * Record a deposit credit entry.
+ */
+async function deposit(playerId, amount, transactionId) {
+    const currentBalance = await walletService.getBalance(playerId);
+    const newBalance = currentBalance + Math.abs(amount);
+    await walletService.updateBalance(playerId, newBalance);
+
+    logger.info('Ledger: deposit', { playerId, amount, transactionId });
+    return { playerId, type: 'deposit', amount: Math.abs(amount), newBalance };
+}
+
+module.exports = { lockBet, creditEntry, deposit };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\wallet\walletService.js 
+// ========================================== 
+
+'use strict';
+
+const logger = require('../utils/logger');
+
+// Auto-granted balance for all demo players connecting to the server
+const DEMO_STARTING_BALANCE = 10000;
+
+// In-Memory Wallet Store:  Map<playerId, balance>
+const demoWallets = new Map();
+
+/**
+ * Get computed wallet balance for a player.
+ * Initializes with DEMO_STARTING_BALANCE if they don't exist yet.
+ */
+async function getBalance(playerId) {
+    if (!demoWallets.has(playerId)) {
+        demoWallets.set(playerId, DEMO_STARTING_BALANCE);
+    }
+    return demoWallets.get(playerId);
+}
+
+/**
+ * Check if a player has at least `amount` available.
+ */
+async function hasEnoughBalance(playerId, amount) {
+    const balance = await getBalance(playerId);
+    return balance >= amount;
+}
+
+/**
+ * Update a player's balance directly (helper for in-memory mutations)
+ */
+async function updateBalance(playerId, newBalance) {
+    demoWallets.set(playerId, newBalance);
+    return newBalance;
+}
+
+module.exports = { getBalance, hasEnoughBalance, updateBalance };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\websocket\connectionManager.js 
+// ========================================== 
+
+'use strict';
+
+const tableManager  = require('../game/tableManager');
+const betModel      = require('../models/betModel');
+const walletService = require('../wallet/walletService');
+const logger        = require('../utils/logger');
+
+const CHAT_COOLDOWN_MS = 2000;    // max one message per 2s per player
+const MAX_CHAT_LEN     = 200;
+const lastChatTime     = new Map();
+
+/** Handle a new authenticated WebSocket connection. */
+async function handleConnect(socket) {
+  const { playerId, username } = socket;
+  logger.info('Player connected', { playerId, username, socketId: socket.id });
+
+  // Fetch balance to populate player record
+  const balance = await walletService.getBalance(playerId);
+
+  // Check if already tracked (reconnect)
+  const existingTable = tableManager.getPlayerTable(playerId);
+
+  let tableId;
+  if (existingTable) {
+    tableId = existingTable;
+    tableManager.updatePlayer(playerId, { balance, socketId: socket.id });
+  } else {
+    tableId = await tableManager.assignPlayer(playerId, username, balance, socket.id);
+  }
+
+  socket.tableId = tableId;
+  socket.join(tableId);
+
+  // Broadcast updated player list to the whole table
+  const ts = tableManager.getTableState(tableId);
+  if (ts) { ts.broadcastPlayerState(); }
+
+  await _sendStateSync(socket, tableId, balance);
+}
+
+/** Handle disconnect â€” mark as disconnected, bets survive */
+function handleDisconnect(socket) {
+  const { playerId } = socket;
+  logger.info('Player disconnected', { playerId });
+  const tableId = tableManager.markDisconnected(playerId);
+  if (tableId) {
+    const ts = tableManager.getTableState(tableId);
+    if (ts) ts.broadcastPlayerState();
+  }
+}
+
+/** Handle explicit TABLE_LEAVE */
+function handleLeave(socket) {
+  const { playerId } = socket;
+  const tableId = tableManager.removePlayer(playerId);
+  if (tableId) {
+    const ts = tableManager.getTableState(tableId);
+    if (ts) ts.broadcastPlayerState();
+  }
+  logger.info('Player left table', { playerId });
+}
+
+/** Handle CHAT_MESSAGE */
+function handleChat(socket, data) {
+  const { playerId, username } = socket;
+  const now  = Date.now();
+  const last = lastChatTime.get(playerId) || 0;
+  if (now - last < CHAT_COOLDOWN_MS) return; // rate limit
+  lastChatTime.set(playerId, now);
+
+  const text = String(data.text || '').trim().slice(0, MAX_CHAT_LEN);
+  if (!text) return;
+
+  const tableId = socket.tableId || tableManager.getPlayerTable(playerId);
+  if (!tableId) return;
+
+  // Broadcast to entire table room
+  const ts = tableManager.getTableState(tableId);
+  if (ts) {
+    ts._io.to(tableId).emit('CHAT_MESSAGE', {
+      playerId, username,
+      text,
+      ts: Date.now(),
+    });
+  }
+}
+
+/**
+ * Full STATE_SYNC â€” sends everything a joining/reconnecting player needs:
+ *   phase, timer, balance, existing bets, bet pools, visible players
+ */
+async function _sendStateSync(socket, tableId, balance) {
+  try {
+    const rm  = tableManager.getRoundManager(tableId);
+    const ts  = tableManager.getTableState(tableId);
+    const roundId = rm ? rm.getCurrentRoundId() : null;
+
+    let existingBets = [];
+    if (roundId) {
+      existingBets = await betModel.getPlayerBetsForRound(socket.playerId, roundId);
+    }
+
+    const roundState = rm ? await rm.getStateSnapshot() : null;
+
+    socket.emit('STATE_SYNC', {
+      tableId,
+      roundId,
+      phase:          roundState ? roundState.phase : null,
+      bettingEndsAt:  rm ? rm.getBetEndTime() : null,
+      commitmentHash: roundState ? roundState.commitmentHash : null,
+      balance:        parseFloat(balance) || 0,
+      existingBets,
+      // Multiplayer table state
+      betTotals:      ts ? { ...ts.betTotals } : { dragon: 0, tiger: 0, tie: 0 },
+      visiblePlayers: ts ? ts.getVisiblePlayers() : [],
+      totalPlayers:   ts ? ts.getPlayerCount() : 0,
+      roundHistory:   ts ? ts.getHistory() : [],
+    });
+
+    logger.debug('STATE_SYNC sent', { playerId: socket.playerId, tableId });
+  } catch (err) {
+    logger.error('Failed to send STATE_SYNC', { playerId: socket.playerId, error: err.message });
+  }
+}
+
+module.exports = { handleConnect, handleDisconnect, handleLeave, handleChat };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\websocket\socketEvents.js 
+// ========================================== 
+
+'use strict';
+
+const connectionManager = require('./connectionManager');
+const betManager        = require('../game/betManager');
+const tableManager      = require('../game/tableManager');
+const walletService     = require('../wallet/walletService');
+const logger            = require('../utils/logger');
+
+function registerEvents(ws) {
+  const { playerId, username } = ws;
+
+  // â”€â”€ Provide .emit() compatibility proxy for downstream files 
+  if (!ws.emit) {
+    ws.emit = ws.emitEvent || ((event, data) => {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ event, data }));
+    });
+  }
+
+  // â”€â”€ Connection lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  connectionManager.handleConnect(ws).catch((err) => {
+    logger.error('handleConnect error', { playerId, error: err.message });
+    ws.close();
+  });
+
+  ws.on('close', (code, reason) => {
+    connectionManager.handleDisconnect(ws);
+    logger.info('WebSocket disconnected', { playerId, code });
+  });
+
+  // â”€â”€ Native WebSocket Message Router â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  ws.on('message', async (messageData) => {
+    try {
+      const parsed = JSON.parse(messageData.toString());
+      if (!parsed.event) return;
+
+      const eventName = parsed.event;
+      const data = parsed.data || {};
+
+      if (eventName === 'TABLE_LEAVE') {
+        connectionManager.handleLeave(ws);
+      } 
+      else if (eventName === 'CHAT_MESSAGE') {
+        connectionManager.handleChat(ws, data);
+      } 
+      else if (eventName === 'PLACE_BET') {
+        await handlePlaceBet(ws, playerId, username, data);
+      } 
+      else if (eventName === 'REQUEST_STATE') {
+        await handleRequestState(ws, playerId);
+      }
+    } catch (err) {
+      logger.warn('Failed to parse WebSocket message', { error: err.message });
+    }
+  });
+}
+
+// â”€â”€ Event Handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function handlePlaceBet(ws, playerId, username, data) {
+  try {
+    const tableId = ws.tableId || tableManager.getPlayerTable(playerId);
+    if (!tableId) return _reply(ws, 'BET_REJECTED', { reason: 'not_in_table' });
+
+    const rm = tableManager.getRoundManager(tableId);
+    if (!rm) return _reply(ws, 'BET_REJECTED', { reason: 'no_active_table' });
+
+    const roundId = rm.getCurrentRoundId();
+    if (!roundId) return _reply(ws, 'BET_REJECTED', { reason: 'no_active_round' });
+
+    const result = await betManager.processBet({
+      playerId, roundId, tableId,
+      betEndTime: rm.getBetEndTime(),
+      data,
+    });
+
+    if (!result.success) {
+      logger.warn('Bet rejected', { playerId, reason: result.reason });
+      return _reply(ws, 'BET_REJECTED', { reason: result.reason, betId: data.betId });
+    }
+
+    const balance = await walletService.getBalance(playerId);
+    const area = result.bet.bet_area;
+    const amount = parseFloat(result.bet.amount);
+
+    // â”€â”€ Update TableState â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const ts = tableManager.getTableState(tableId);
+    if (ts) {
+      ts.recordBet(playerId, area, amount);
+      ts.updateBalance(playerId, balance);
+      ts.broadcastBetTotals();              // TABLE_UPDATE to room
+      ts.broadcastBetPlaced(playerId, username, area, amount); // PLAYER_BET chip animation
+      ts.broadcastPlayerState();            // PLAYER_STATE with updated balances
+    }
+
+    // â”€â”€ Reply to bettor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    _reply(ws, 'BET_ACCEPTED', {
+      betId: data.betId,
+      area,
+      amount,
+      roundId,
+      balance,
+    });
+
+    tableManager.updatePlayerBalance(playerId, balance);
+    ws.emit('balanceUpdate', { playerId, balance });
+
+  } catch (err) {
+    logger.error('PLACE_BET handler error', { playerId, error: err.message });
+    _reply(ws, 'BET_REJECTED', { reason: 'server_error' });
+  }
+}
+
+async function handleRequestState(ws, playerId) {
+  const tableId = ws.tableId || tableManager.getPlayerTable(playerId);
+  if (!tableId) return;
+
+  const rm = tableManager.getRoundManager(tableId);
+  const ts = tableManager.getTableState(tableId);
+  const roundState = rm ? await rm.getStateSnapshot() : null;
+  const balance = await walletService.getBalance(playerId);
+
+  const payload = {
+    tableId,
+    phase: roundState ? roundState.phase : null,
+    bettingEndsAt: rm ? rm.getBetEndTime() : null,
+    commitmentHash: roundState ? roundState.commitmentHash : null,
+    balance,
+    betTotals: ts ? { ...ts.betTotals } : { dragon: 0, tiger: 0, tie: 0 },
+    visiblePlayers: ts ? ts.getVisiblePlayers() : [],
+    totalPlayers: ts ? ts.getPlayerCount() : 0,
+  };
+
+  ws.emit('STATE_SYNC', payload);
+}
+
+function _reply(ws, eventName, payload) {
+  ws.emit(eventName, payload);
+}
+
+module.exports = { registerEvents };
+
+
+
+// ========================================== 
+// FILE: E:\GitHub\automatic-octo-meme\dtServer\src\websocket\socketServer.js 
+// ========================================== 
+
+'use strict';
+
+const { WebSocketServer } = require('ws');
+const logger = require('../utils/logger');
+
+let wss = null;
+
+/**
+ * Initialize pure WebSockets on the given HTTP server.
+ * Applies DEMO Guest creation to every incoming connection.
+ */
+function init(httpServer) {
+    wss = new WebSocketServer({ server: httpServer });
+
+    wss.on('connection', (ws, req) => {
+        // --- DEMO MODE: Auto-Generate Guest Players ---
+        const randomId = Math.floor(Math.random() * 9000) + 1000;
+        ws.playerId = `id_${randomId}`;
+        ws.username = `DemoPlayer_${randomId}`;
+
+        // Shim 'emit' so the rest of the socketEvents code still works seamlessly
+        ws.emitEvent = (eventName, payload) => {
+            if (ws.readyState === 1) { // OPEN
+                ws.send(JSON.stringify({ event: eventName, data: payload }));
+            }
+        };
+        
+        // Shim for room broadcasting (not natively supported in pure ws)
+        ws.join = (room) => {
+            ws.room = room; 
+        };
+
+        logger.info('Demo player connected via raw WS', { username: ws.username });
+    });
+
+    // Provide a shim io object so tableManager can broadcast to rooms
+    const ioShim = {
+        to: (room) => ({
+            emit: (eventName, payload) => {
+                wss.clients.forEach(client => {
+                    if (client.readyState === 1 && client.room === room) {
+                        client.send(JSON.stringify({ event: eventName, data: payload }));
+                    }
+                });
+            }
+        })
+    };
+
+    logger.info('Native WebSocket server initialized in DEMO mode');
+    return { wss, ioShim };
+}
+
+function getIo() {
+    if (!wss) throw new Error('WebSocket not initialized');
+    // return the same shim structure expected by the rest of the app
+    return {
+        to: (room) => ({
+            emit: (eventName, payload) => {
+                wss.clients.forEach(client => {
+                    if (client.readyState === 1 && client.room === room) {
+                        client.send(JSON.stringify({ event: eventName, data: payload }));
+                    }
+                });
+            }
+        })
+    };
+}
+
+module.exports = { init, getIo };
+
