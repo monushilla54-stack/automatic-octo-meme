@@ -10,6 +10,24 @@ const CHAT_COOLDOWN_MS = 2000;    // max one message per 2s per player
 const MAX_CHAT_LEN     = 200;
 const lastChatTime     = new Map();
 
+function sendToSocket(socket, eventName, payload) {
+  if (!socket) return;
+
+  if (typeof socket.sendEvent === 'function') {
+    socket.sendEvent(eventName, payload);
+    return;
+  }
+
+  if (typeof socket.emitEvent === 'function') {
+    socket.emitEvent(eventName, payload);
+    return;
+  }
+
+  if (socket.readyState === 1 && typeof socket.send === 'function') {
+    socket.send(JSON.stringify({ event: eventName, data: payload }));
+  }
+}
+
 /** Handle a new authenticated WebSocket connection. */
 async function handleConnect(socket) {
   const { playerId, username } = socket;
@@ -111,7 +129,7 @@ async function _sendStateSync(socket, tableId, balance) {
        roundState.phase === 'PAYOUT' ||
        roundState.phase === 'ROUND_COMPLETE');
 
-    socket.emit('STATE_SYNC', {
+    sendToSocket(socket, 'STATE_SYNC', {
       tableId,
       roundId,
       phase:          roundState ? roundState.phase : null,

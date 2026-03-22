@@ -1,34 +1,43 @@
 'use strict';
 
 const connectionManager = require('./connectionManager');
-const betManager        = require('../game/betManager');
-const tableManager      = require('../game/tableManager');
-const roundModel        = require('../models/roundModel');
-const walletService     = require('../wallet/walletService');
-const logger            = require('../utils/logger');
+const betManager = require('../game/betManager');
+const tableManager = require('../game/tableManager');
+const roundModel = require('../models/roundModel');
+const walletService = require('../wallet/walletService');
+const logger = require('../utils/logger');
+
+function sendToSocket(ws, eventName, payload) {
+  if (!ws) return;
+
+  if (typeof ws.sendEvent === 'function') {
+    ws.sendEvent(eventName, payload);
+    return;
+  }
+
+  if (typeof ws.emitEvent === 'function') {
+    ws.emitEvent(eventName, payload);
+    return;
+  }
+
+  if (ws.readyState === 1 && typeof ws.send === 'function') {
+    ws.send(JSON.stringify({ event: eventName, data: payload }));
+  }
+}
 
 function registerEvents(ws) {
   const { playerId, username } = ws;
 
-  // ── Provide .emit() compatibility proxy for downstream files 
-  if (!ws.emit) {
-    ws.emit = ws.emitEvent || ((event, data) => {
-      if (ws.readyState === 1) ws.send(JSON.stringify({ event, data }));
-    });
-  }
-
-  // ── Connection lifecycle ──────────────────────────────
   connectionManager.handleConnect(ws).catch((err) => {
     logger.error('handleConnect error', { playerId, error: err.message });
     ws.close();
   });
 
-  ws.on('close', (code, reason) => {
+  ws.on('close', (code) => {
     connectionManager.handleDisconnect(ws);
     logger.info('WebSocket disconnected', { playerId, code });
   });
 
-  // ── Native WebSocket Message Router ───────────────────
   ws.on('message', async (messageData) => {
     try {
       const parsed = JSON.parse(messageData.toString());
@@ -39,14 +48,11 @@ function registerEvents(ws) {
 
       if (eventName === 'TABLE_LEAVE') {
         connectionManager.handleLeave(ws);
-      } 
-      else if (eventName === 'CHAT_MESSAGE') {
+      } else if (eventName === 'CHAT_MESSAGE') {
         connectionManager.handleChat(ws, data);
-      } 
-      else if (eventName === 'PLACE_BET') {
+      } else if (eventName === 'PLACE_BET') {
         await handlePlaceBet(ws, playerId, username, data);
-      } 
-      else if (eventName === 'REQUEST_STATE') {
+      } else if (eventName === 'REQUEST_STATE') {
         await handleRequestState(ws, playerId);
       }
     } catch (err) {
@@ -55,20 +61,21 @@ function registerEvents(ws) {
   });
 }
 
-// ── Event Handlers ──────────────────────────────────────
 async function handlePlaceBet(ws, playerId, username, data) {
   try {
     const tableId = ws.tableId || tableManager.getPlayerTable(playerId);
-    if (!tableId) return _reply(ws, 'BET_REJECTED', { reason: 'not_in_table' });
+    if (!tableId) return reply(ws, 'BET_REJECTED', { reason: 'not_in_table' });
 
     const rm = tableManager.getRoundManager(tableId);
-    if (!rm) return _reply(ws, 'BET_REJECTED', { reason: 'no_active_table' });
+    if (!rm) return reply(ws, 'BET_REJECTED', { reason: 'no_active_table' });
 
     const roundId = rm.getCurrentRoundId();
-    if (!roundId) return _reply(ws, 'BET_REJECTED', { reason: 'no_active_round' });
+    if (!roundId) return reply(ws, 'BET_REJECTED', { reason: 'no_active_round' });
 
     const result = await betManager.processBet({
-      playerId, roundId, tableId,
+      playerId,
+      roundId,
+      tableId,
       betEndTime: rm.getBetEndTime(),
       data,
     });
@@ -77,25 +84,23 @@ async function handlePlaceBet(ws, playerId, username, data) {
 
     if (!result.success) {
       logger.warn('Bet rejected', { playerId, reason: result.reason });
-      return _reply(ws, 'BET_REJECTED', { reason: result.reason, betId: data.betId });
+      return reply(ws, 'BET_REJECTED', { reason: result.reason, betId: data.betId });
     }
 
     const balance = await walletService.getBalance(playerId);
     const area = result.bet.bet_area;
     const amount = parseFloat(result.bet.amount);
 
-    // ── Update TableState ─────────────────────────────
     const ts = tableManager.getTableState(tableId);
     if (ts) {
       ts.recordBet(playerId, area, amount);
       ts.updateBalance(playerId, balance);
-      ts.broadcastBetTotals();              // TABLE_UPDATE to room
-      ts.broadcastBetPlaced(playerId, username, area, amount); // PLAYER_BET chip animation
-      ts.broadcastPlayerState();            // PLAYER_STATE with updated balances
+      ts.broadcastBetTotals();
+      ts.broadcastBetPlaced(playerId, username, area, amount);
+      ts.broadcastPlayerState();
     }
 
-    // ── Reply to bettor ───────────────────────────────
-    _reply(ws, 'BET_ACCEPTED', {
+    reply(ws, 'BET_ACCEPTED', {
       betId: data.betId,
       area,
       amount,
@@ -104,11 +109,10 @@ async function handlePlaceBet(ws, playerId, username, data) {
     });
 
     tableManager.updatePlayerBalance(playerId, balance);
-    ws.emit('balanceUpdate', { playerId, balance });
-
+    sendToSocket(ws, 'balanceUpdate', { playerId, balance });
   } catch (err) {
     logger.error('PLACE_BET handler error', { playerId, error: err.message });
-    _reply(ws, 'BET_REJECTED', { reason: 'server_error' });
+    reply(ws, 'BET_REJECTED', { reason: 'server_error' });
   }
 }
 
@@ -122,7 +126,13 @@ async function handleRequestState(ws, playerId) {
   const balance = await walletService.getBalance(playerId);
   const roundHistory = await roundModel.getRecentHistoryForTable(tableId, 10);
 
-  const payload = {
+  const canReveal =
+    roundState &&
+    (roundState.phase === 'RESULT_REVEAL' ||
+      roundState.phase === 'PAYOUT' ||
+      roundState.phase === 'ROUND_COMPLETE');
+
+  sendToSocket(ws, 'STATE_SYNC', {
     tableId,
     roundId: rm ? rm.getCurrentRoundId() : null,
     phase: roundState ? roundState.phase : null,
@@ -132,52 +142,22 @@ async function handleRequestState(ws, playerId) {
     commitmentHash: roundState ? roundState.commitmentHash : null,
     serverTime: Date.now(),
     balance,
-    winner:
-      roundState &&
-      (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
-        ? roundState.winner
-        : null,
-    dragonCard:
-      roundState &&
-      (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
-        ? roundState.dragonCard
-        : null,
-    dragonSuit:
-      roundState &&
-      (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
-        ? roundState.dragonSuit
-        : null,
-    dragonLabel:
-      roundState &&
-      (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
-        ? roundState.dragonLabel
-        : null,
-    tigerCard:
-      roundState &&
-      (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
-        ? roundState.tigerCard
-        : null,
-    tigerSuit:
-      roundState &&
-      (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
-        ? roundState.tigerSuit
-        : null,
-    tigerLabel:
-      roundState &&
-      (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
-        ? roundState.tigerLabel
-        : null,
+    winner: canReveal ? roundState.winner : null,
+    dragonCard: canReveal ? roundState.dragonCard : null,
+    dragonSuit: canReveal ? roundState.dragonSuit : null,
+    dragonLabel: canReveal ? roundState.dragonLabel : null,
+    tigerCard: canReveal ? roundState.tigerCard : null,
+    tigerSuit: canReveal ? roundState.tigerSuit : null,
+    tigerLabel: canReveal ? roundState.tigerLabel : null,
     betTotals: ts ? { ...ts.betTotals } : { dragon: 0, tiger: 0, tie: 0 },
     visiblePlayers: ts ? ts.getVisiblePlayers() : [],
     totalPlayers: ts ? ts.getPlayerCount() : 0,
     roundHistory,
-  };
-
-  ws.emit('STATE_SYNC', payload);
+  });
 }
 
-function _reply(ws, eventName, payload) {
-  ws.emit(eventName, payload);
+function reply(ws, eventName, payload) {
+  sendToSocket(ws, eventName, payload);
 }
 
 module.exports = { registerEvents };

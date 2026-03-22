@@ -27,6 +27,7 @@ function init(httpServer) {
                 ws.send(JSON.stringify({ event: eventName, data: payload }));
             }
         };
+        ws.sendEvent = ws.emitEvent;
         
         // Shim for room broadcasting (not natively supported in pure ws)
         ws.join = (room) => {
