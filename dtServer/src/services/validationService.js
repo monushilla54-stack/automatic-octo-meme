@@ -1,6 +1,7 @@
 'use strict';
 
 const Joi = require('joi');
+const ALLOWED_BET_AMOUNTS = [10, 100, 500, 1000, 5000];
 
 const registrationSchema = Joi.object({
     email: Joi.string().email().required(),
@@ -17,7 +18,7 @@ const betSchema = Joi.object({
     type: Joi.string().valid('PLACE_BET').required(),
     betId: Joi.string().min(1).max(100).required(),
     area: Joi.string().valid('dragon', 'tiger', 'tie').required(),
-    amount: Joi.number().positive().required(),
+    amount: Joi.number().valid(...ALLOWED_BET_AMOUNTS).required(),
     timestamp: Joi.number().integer().required(),
 });
 
@@ -41,4 +42,4 @@ function validateDeposit(data) {
     return depositSchema.validate(data);
 }
 
-module.exports = { validateRegistration, validateLogin, validateBetMessage, validateDeposit };
+module.exports = { validateRegistration, validateLogin, validateBetMessage, validateDeposit, ALLOWED_BET_AMOUNTS };

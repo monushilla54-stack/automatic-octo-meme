@@ -14,7 +14,7 @@ const DEMO_BOTS = [
 ];
 
 const BET_AREAS = ['dragon', 'tiger', 'tie'];
-const BET_AMOUNTS = [100, 500, 1000];
+const BET_AMOUNTS = [10, 100, 500, 1000, 5000];
 
 let botInterval = null;
 

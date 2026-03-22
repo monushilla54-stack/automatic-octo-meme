@@ -7,6 +7,7 @@ const ledgerService = require('../wallet/ledgerService');
 const validationService = require('../services/validationService');
 const { game } = require('../config/environment');
 const logger = require('../utils/logger');
+const { ALLOWED_BET_AMOUNTS } = validationService;
 
 // Replay protection window: reject bets with timestamps older than this
 const REPLAY_WINDOW_MS = 15000;
@@ -39,8 +40,8 @@ async function processBet({ playerId, roundId, tableId, betEndTime, data }) {
     }
 
     // --- 4. Bet amount limits ---
-    if (amount < game.minBet || amount > game.maxBet) {
-        return { success: false, reason: `amount_out_of_range: min=${game.minBet} max=${game.maxBet}` };
+    if (!ALLOWED_BET_AMOUNTS.includes(amount)) {
+        return { success: false, reason: `amount_not_allowed: allowed=${ALLOWED_BET_AMOUNTS.join(',')}` };
     }
 
     // --- 5. Duplicate bet protection (Redis Set) ---
