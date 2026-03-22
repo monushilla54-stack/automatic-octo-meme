@@ -124,8 +124,10 @@ async function _sendStateSync(socket, tableId, balance) {
       existingBets,
       winner:         canRevealResult ? roundState.winner : null,
       dragonCard:     canRevealResult ? roundState.dragonCard : null,
+      dragonSuit:     canRevealResult ? roundState.dragonSuit : null,
       dragonLabel:    canRevealResult ? roundState.dragonLabel : null,
       tigerCard:      canRevealResult ? roundState.tigerCard : null,
+      tigerSuit:      canRevealResult ? roundState.tigerSuit : null,
       tigerLabel:     canRevealResult ? roundState.tigerLabel : null,
       // Multiplayer table state
       betTotals:      ts ? { ...ts.betTotals } : { dragon: 0, tiger: 0, tie: 0 },

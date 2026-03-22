@@ -9,13 +9,17 @@ const PAYOUT_MULTIPLIERS = {
 
 /**
  * Determine the winner of a round.
- * @param {number} dragonCard
- * @param {number} tigerCard
+ * Only rank matters for Dragon Tiger.
+ * @param {number|{rank:number}} dragonCard
+ * @param {number|{rank:number}} tigerCard
  * @returns {'dragon'|'tiger'|'tie'}
  */
 function determineWinner(dragonCard, tigerCard) {
-    if (dragonCard > tigerCard) return 'dragon';
-    if (tigerCard > dragonCard) return 'tiger';
+    const dragonRank = typeof dragonCard === 'object' && dragonCard !== null ? dragonCard.rank : dragonCard;
+    const tigerRank = typeof tigerCard === 'object' && tigerCard !== null ? tigerCard.rank : tigerCard;
+
+    if (dragonRank > tigerRank) return 'dragon';
+    if (tigerRank > dragonRank) return 'tiger';
     return 'tie';
 }
 

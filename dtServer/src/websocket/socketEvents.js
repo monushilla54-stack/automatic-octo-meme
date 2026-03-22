@@ -142,6 +142,11 @@ async function handleRequestState(ws, playerId) {
       (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
         ? roundState.dragonCard
         : null,
+    dragonSuit:
+      roundState &&
+      (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
+        ? roundState.dragonSuit
+        : null,
     dragonLabel:
       roundState &&
       (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
@@ -151,6 +156,11 @@ async function handleRequestState(ws, playerId) {
       roundState &&
       (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
         ? roundState.tigerCard
+        : null,
+    tigerSuit:
+      roundState &&
+      (roundState.phase === 'RESULT_REVEAL' || roundState.phase === 'PAYOUT' || roundState.phase === 'ROUND_COMPLETE')
+        ? roundState.tigerSuit
         : null,
     tigerLabel:
       roundState &&

@@ -17,7 +17,7 @@ const router = express.Router();
  *     roundId, dragonCard, tigerCard, winner,
  *     commitmentHash, nonce,
  *     verified: true/false,
- *     howToVerify: "SHA256(dragonCard:tigerCard:nonce) === commitmentHash"
+ *     howToVerify: "SHA256('Suit-rank:Suit-rank:nonce') === commitmentHash"
  *   }
  */
 router.get('/:roundId', async (req, res) => {
@@ -49,7 +49,7 @@ router.get('/:roundId', async (req, res) => {
       commitmentHash: round.commitment_hash,
       nonce:          round.server_nonce,
       verified,
-      howToVerify: 'SHA256(`${dragonCard}:${tigerCard}:${nonce}`) must equal commitmentHash',
+      howToVerify: 'SHA256(`${dragonCard.suit}-${dragonCard.rank}:${tigerCard.suit}-${tigerCard.rank}:${nonce}`) must equal commitmentHash',
       createdAt:   round.created_at,
     });
 

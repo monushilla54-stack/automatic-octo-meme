@@ -76,7 +76,9 @@ class RoundManager extends EventEmitter {
 
     if (!canRevealResult) {
       delete publicState.dragonCard;
+      delete publicState.dragonSuit;
       delete publicState.tigerCard;
+      delete publicState.tigerSuit;
       delete publicState.dragonLabel;
       delete publicState.tigerLabel;
       delete publicState.winner;
@@ -148,8 +150,10 @@ class RoundManager extends EventEmitter {
       this.currentRound = {
         roundId: dbRound.round_id,
         tableId: this.tableId,
-        dragonCard,
-        tigerCard,
+        dragonCard: dragonCard.rank,
+        dragonSuit: dragonCard.suit,
+        tigerCard: tigerCard.rank,
+        tigerSuit: tigerCard.suit,
         nonce,
         commitmentHash,
         phase: PHASE.ROUND_INITIALIZATION,
@@ -230,10 +234,10 @@ class RoundManager extends EventEmitter {
   }
 
   async _phaseResultReveal() {
-    const { dragonCard, tigerCard, nonce, commitmentHash, roundId } = this.currentRound;
+    const { dragonCard, dragonSuit, tigerCard, tigerSuit, nonce, commitmentHash, roundId } = this.currentRound;
     const winner = determineWinner(dragonCard, tigerCard);
 
-    await roundModel.updateRoundResult({ roundId, dragonCard, tigerCard, winner, nonce });
+    await roundModel.updateRoundResult({ roundId, dragonCard, dragonSuit, tigerCard, tigerSuit, winner, nonce });
 
     this._markPhase(PHASE.RESULT_REVEAL, game.revealPhaseDuration, {
       winner,
@@ -248,8 +252,10 @@ class RoundManager extends EventEmitter {
       roundId,
       phaseEndsAt: this.currentRound.phaseEndsAt,
       dragonCard,
+      dragonSuit,
       dragonLabel: this.currentRound.dragonLabel,
       tigerCard,
+      tigerSuit,
       tigerLabel: this.currentRound.tigerLabel,
       winner,
       proof: {

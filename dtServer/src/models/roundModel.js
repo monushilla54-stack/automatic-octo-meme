@@ -1,6 +1,6 @@
 'use strict';
 
-const { cardLabel } = require('../game/rngService');
+const { cardLabel, cardName, getCardColor } = require('../game/rngService');
 
 // In-Memory Rounds Store: Array of round objects
 const demoRounds = [
@@ -9,8 +9,8 @@ const demoRounds = [
         table_id: 'table_1',
         status: 'complete',
         winner: 'dragon',
-        dragon_card: 10,
-        tiger_card: 5,
+        dragon_card: { suit: 'Hearts', rank: 10, color: 'Red', label: '10', name: '10 of Hearts' },
+        tiger_card: { suit: 'Spades', rank: 5, color: 'Black', label: '5', name: '5 of Spades' },
         completed_at: new Date(Date.now() - 60000).toISOString()
     },
     {
@@ -18,8 +18,8 @@ const demoRounds = [
         table_id: 'table_1',
         status: 'complete',
         winner: 'tiger',
-        dragon_card: 3,
-        tiger_card: 12,
+        dragon_card: { suit: 'Clubs', rank: 3, color: 'Black', label: '3', name: '3 of Clubs' },
+        tiger_card: { suit: 'Diamonds', rank: 12, color: 'Red', label: 'Q', name: 'Q of Diamonds' },
         completed_at: new Date(Date.now() - 30000).toISOString()
     }
 ];
@@ -39,11 +39,11 @@ async function createRound({ tableId, commitmentHash }) {
 /**
  * Persist result and reveal the nonce (completes the commit-reveal).
  */
-async function updateRoundResult({ roundId, dragonCard, tigerCard, winner, nonce }) {
+async function updateRoundResult({ roundId, dragonCard, tigerCard, dragonSuit, tigerSuit, winner, nonce }) {
     const round = demoRounds.find(r => r.round_id === roundId);
     if (round) {
-        round.dragon_card = dragonCard;
-        round.tiger_card = tigerCard;
+        round.dragon_card = buildStoredCard(dragonCard, dragonSuit);
+        round.tiger_card = buildStoredCard(tigerCard, tigerSuit);
         round.winner = winner;
         round.server_nonce = nonce;
         round.status = 'complete';
@@ -72,6 +72,19 @@ function toHistoryEntry(round) {
         dragonLabel: round.dragon_card ? cardLabel(round.dragon_card) : '',
         tigerLabel: round.tiger_card ? cardLabel(round.tiger_card) : '',
         ts: Date.parse(round.completed_at || round.created_at) || Date.now(),
+    };
+}
+
+function buildStoredCard(rank, suit) {
+    if (!rank || !suit) return null;
+
+    const card = { rank, suit };
+    return {
+        rank,
+        suit,
+        color: getCardColor(suit),
+        label: cardLabel(card),
+        name: cardName(card),
     };
 }
 
