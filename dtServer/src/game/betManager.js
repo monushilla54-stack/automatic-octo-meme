@@ -9,7 +9,7 @@ const { game } = require('../config/environment');
 const logger = require('../utils/logger');
 
 // Replay protection window: reject bets with timestamps older than this
-const REPLAY_WINDOW_MS = 5000;
+const REPLAY_WINDOW_MS = 15000;
 // Close betting this many ms before betEndTime to absorb network latency
 const EARLY_CLOSE_MS = 500;
 
